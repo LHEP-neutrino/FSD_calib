@@ -13,6 +13,7 @@ import numpy as np
 import logging
 import argparse
 import h5py
+import matplotlib.pyplot as plt
 
 
 
@@ -185,18 +186,31 @@ class calibClass:
         logger.debug(f"Number of events in the selection: {len(self.light_events)}")
         logger.debug(f"Shape of the waveforms array: {self.light_wvfms.shape}")
 
-    def _extract_peak(self, wvfm, minWidth, verbose=False):
+    def _extract_peak(self, wvfm, minWidth, mode='default', search_int = None, cut=None):
         '''
-        minWidth: Minimal width of a peak (e.g. a 5 ticks peaks have two values lower than the peak summit on each side)
+            extract the peak of the waveforms in the between range[0] and range[1].
+
+            Args:
+                minWidth:   Minimal width of a peak (e.g. a 5 ticks peaks have two values lower than the peak summit on each side)
+                mode:       Mode of the returned peaks
+                    - 'default':    return only the peak above the mean
+                search_int:      indices of the intervall of the wvfm in which to search for peak
         '''
         peak_idx = []
         is_peak = True
+        Npt_peakSide = int(minWidth/2)
         mean = np.mean(wvfm)
 
-        Npt_peakSide = int(minWidth/2)
+        if search_int == None:
+            search_int = np.array([0, len(wvfm)-1])
 
-
-        for ix in range(Npt_peakSide+1, len(wvfm)-Npt_peakSide-1):
+        else:
+            search_int = np.sort(search_int)
+            if search_int[0] < 0 or search_int[1] > len(wvfm)-1:
+                raise ValueError('The given search interval is out of bound')
+            search_int += [-Npt_peakSide, Npt_peakSide]
+        
+        for ix in range(search_int[0]+Npt_peakSide+1, search_int[1]-Npt_peakSide-1):
             for i in range(1, Npt_peakSide+1):
                 if (wvfm[ix-i] > wvfm[ix] or wvfm[ix+i] > wvfm[ix]):
                     is_peak = False
@@ -207,17 +221,21 @@ class calibClass:
             else:
                 is_peak = True
 
-        peak_idx = np.array(peak_idx)
+        peak_idx = np.array(peak_idx, dtype=int)
         
-        if (verbose==False):
+        if (mode=='default'):
+           # Only return the peak above the mean
            aboveMean_idx = np.where(wvfm[peak_idx]>mean)[0]
            peak_idx = peak_idx[aboveMean_idx]
+
+        if (cut == '15ticks'):
+            peak_idx = np.array([peak_idx[i] for i in range(1, len(peak_idx)-1) if peak_idx[i-1] + 15 < peak_idx[i] < peak_idx[i+1] - 15], dtype=int)
 
         return peak_idx, mean 
     
 
     
-    def findPeak_wvfms(self, event, adc, chan, minWidth=5):
+    def findPeak_wvfms(self, event, adc, chan, minWidth=5, search_int=None, cut=None):
         '''
         Find the number of peak and store it in self.Npeaks
 
@@ -227,13 +245,15 @@ class calibClass:
         Return:
             None
         '''
+        if isinstance(event, int):
+            peak_idx, *peak_info = self._extract_peak(self.light_wvfms[event][adc,chan], minWidth, search_int=search_int, cut=cut)
+            self.peaks_idx[event][adc][chan] = peak_idx
 
-        peak_idx, *peak_info = self._extract_peak(self.light_wvfms[event][adc,chan], minWidth)
-        
-        logger.debug(f'{len(peak_idx)} peaks were found with a minWidth of {minWidth}.')
-
-        
-        self.peaks_idx[event][adc][chan] = peak_idx
+        elif isinstance(event, list):
+            for i_event in range(event[0], event[1]):
+                peak_idx, *peak_info = self._extract_peak(self.light_wvfms[i_event][adc,chan], minWidth, search_int=search_int, cut=cut)
+                
+                self.peaks_idx[i_event][adc][chan] = peak_idx
 
         return None
 
@@ -278,22 +298,82 @@ class calibClass:
 
         return None
     
-    def compute_fingerplots(self, Nevent = -1, Int_window = [65, 85], Nbins=200):
+    def compute_fingerplots(self, Nevent = -1, Int_window=[0, -1], Nbins=200, mode='integral', cut=None):
         '''
         Plot the distribution of integrated waveforms, so called fingers plot
+
+        Args:
+            Nevent (int)                    : Number of event include in the computation (default: -1, all events)
+            Int_window (np.array or list)   : Integaration window, the waveform will be integrated from Int_window[0] to Int_window[1]
+            mode (str)                      : Mode of computation
+                - 'integral' (default) : Integrate the waveform in the given window
+                - 'amplitude'          : Maximal amplitude of the peak
+                - 'amplitude_peaks'    : Includes all the peaks found by the peak finder
+
+                - 'fit_int'            : Integral of the fitted waveform, TODO
+                - 'fit_amp'            : Max. amplitude of the fitted waveform, TODO
+            cut (str)                       : Cut(s) applied to the select event
+                - None (default)       : No cut
+                - 1peak                : Only select event with one peak in 'Int_window' 
+                - 15ticks              : Only select peak at least 15 ticks away from neighbouring peaks   
         '''
+
+        # Cut variable
+        minWidth = 9
 
         if Nevent == -1 or Nevent > self.light_wvfms.shape[0]:
             Nevent = self.light_wvfms.shape[0]
 
         logger.debug(f"Computing the fingerplots of the file {self.file} with {Nevent} events")
+
         
-        for i_adc in range(N_ADC):
-            for j_chan in range(N_chan_ADC):
+        if (mode == 'integral'):
+            for i_adc in range(N_ADC):
+                for j_chan in range(N_chan_ADC):
+                    if (cut == '1peak'):
+                        self.findPeak_wvfms([0, Nevent], i_adc, j_chan, minWidth=minWidth, search_int=Int_window)
+                        event_mask = np.full((Nevent), True, dtype=bool)
+                        for k_event in range(Nevent):
+                            event_mask[k_event] = (len(self.peaks_idx[k_event][i_adc][j_chan])==1)
+                        event_mask = np.where(event_mask)[0]
+                        intsWvfm = np.sum(self.light_wvfms[event_mask, i_adc, j_chan, Int_window[0]:Int_window[1]], axis=-1)
 
-                intsWvfm = np.sum(self.light_wvfms[:Nevent, i_adc, j_chan, Int_window[0]:Int_window[1]], axis=-1)
+                    else:
+                        intsWvfm = np.sum(self.light_wvfms[:Nevent, i_adc, j_chan, Int_window[0]:Int_window[1]], axis=-1)
 
-                self.fingerplots[i_adc][j_chan] = np.histogram(intsWvfm, bins=Nbins)
+                    self.fingerplots[i_adc][j_chan] = np.histogram(intsWvfm, bins=Nbins)
+        
+        elif (mode == 'amplitude'):
+            for i_adc in range(N_ADC):
+                for j_chan in range(N_chan_ADC):
+                    if (cut == '1peak'):
+                        self.findPeak_wvfms([0, Nevent], i_adc, j_chan, minWidth=minWidth, search_int=Int_window)
+                        event_mask = np.full((Nevent), True, dtype=bool)
+                        for k_event in range(Nevent):
+                            event_mask[k_event] = (len(self.peaks_idx[k_event][i_adc][j_chan])==1)
+                        event_mask = np.where(event_mask)[0]
+                        ampWvfm = np.max(self.light_wvfms[event_mask, i_adc, j_chan, Int_window[0]:Int_window[1]], axis=-1)
+
+
+                    else:
+                        ampWvfm = np.max(self.light_wvfms[:Nevent, i_adc, j_chan, Int_window[0]:Int_window[1]], axis=-1)
+
+                    self.fingerplots[i_adc][j_chan] = np.histogram(ampWvfm, bins=Nbins)
+
+        elif (mode == 'amplitude_peaks'):
+            for i_adc in range(N_ADC):
+                for j_chan in range(N_chan_ADC):
+                    self.findPeak_wvfms([0, Nevent], i_adc, j_chan, minWidth=minWidth, search_int=Int_window, cut=cut)
+
+                    ampsWvfm = np.array([])
+                    for k_event in range(Nevent):
+                        # print(f'event {k_event}: {self.light_wvfms[k_event, i_adc, j_chan, self.peaks_idx[k_event][i_adc][j_chan]]}')
+                        ampsWvfm = np.concatenate((ampsWvfm, self.light_wvfms[k_event, i_adc, j_chan, self.peaks_idx[k_event][i_adc][j_chan]]), axis=None)
+
+                    # print(ampsWvfm)
+                    self.fingerplots[i_adc][j_chan] = np.histogram(ampsWvfm, bins=Nbins)
+
+        logger.debug(f'Finger plot computed with {Nevent} events in mode "{mode}"')
 
         return None
 
@@ -341,6 +421,23 @@ def parse_args():
     parser.add_argument("-ll", "--log_level",type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help="Log level")
     
     return parser.parse_args()
+
+def plot_fingerplot(counts, bins, title=''):
+
+    fig = plt.figure(figsize=[10, 6])
+    ax = fig.subplots()
+
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    width = bins[1] - bins[0]
+
+    ax.bar(bin_centers, counts, width=width, color='skyblue', label=f'N = {np.sum(counts)}')
+
+    ax.set_title(title, fontsize=8)
+    ax.legend()
+
+    fig.show()
+
+    return None
 
 
 if __name__ == "__main__":
